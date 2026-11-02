@@ -1,1 +1,223 @@
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import scipy.sparse as sp
+from scipy.linalg import solve
+import matplotlib.pyplot as plt
+import time
 
+# 1. Project Directory & Data Loading
+PROJECT_ROOT = Path(".")
+PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
+
+train = pd.read_csv(PROCESSED_DIR / "train.csv")
+validation = pd.read_csv(PROCESSED_DIR / "validation.csv")
+test = pd.read_csv(PROCESSED_DIR / "test.csv")
+
+# Create consistent 0-based index mappings from the training set
+unique_users = np.sort(train["user_id"].unique())
+unique_movies = np.sort(train["movie_id"].unique())
+
+user_to_idx = {uid: i for i, uid in enumerate(unique_users)}
+movie_to_idx = {mid: j for j, mid in enumerate(unique_movies)}
+
+n_users = len(unique_users)
+n_movies = len(unique_movies)
+
+def df_to_coo(df):
+    rows = df["user_id"].map(user_to_idx).to_numpy()
+    cols = df["movie_id"].map(movie_to_idx).to_numpy()
+    vals = df["rating"].to_numpy(dtype=np.float64)
+    return sp.coo_matrix((vals, (rows, cols)), shape=(n_users, n_movies))
+
+R_train_coo = df_to_coo(train)
+R_val_coo = df_to_coo(validation)
+R_test_coo = df_to_coo(test)
+
+# Convert to CSR for fast row (user) access and CSC.T for fast column (movie) access
+R_train_csr = R_train_coo.tocsr()
+R_train_T_csr = R_train_coo.tocsc().T.tocsr()
+
+print(f"Users: {n_users}, Movies: {n_movies}")
+print(f"Observed entries -> Train: {R_train_coo.nnz}, Validation: {R_val_coo.nnz}, Test: {R_test_coo.nnz}")
+
+
+# 2. Sub-problem Solver and Regularized ALS Algorithm Implementation
+def solve_als_subproblem(fixed_factors, ratings_csr, lambda_reg):
+    n_targets = ratings_csr.shape[0]
+    k = fixed_factors.shape[1]
+    updated_factors = np.zeros((n_targets, k), dtype=np.float64)
+    reg_eye = lambda_reg * np.eye(k, dtype=np.float64)
+
+    indptr = ratings_csr.indptr
+    indices = ratings_csr.indices
+    data = ratings_csr.data
+
+    for i in range(n_targets):
+        start, end = indptr[i], indptr[i + 1]
+        if start == end:
+            continue
+        
+        obs_idx = indices[start:end]
+        obs_ratings = data[start:end]
+        
+        F_sub = fixed_factors[obs_idx]
+        
+        A = F_sub.T @ F_sub + reg_eye
+        b = F_sub.T @ obs_ratings
+        
+        updated_factors[i] = solve(A, b, assume_a="pos")
+
+    return updated_factors
+
+
+def evaluate_metrics_sparse(R_coo, U, V):
+    preds = np.sum(U[R_coo.row] * V[R_coo.col], axis=1)
+    errors = preds - R_coo.data
+    rmse = float(np.sqrt(np.mean(errors ** 2)))
+    mae = float(np.mean(np.abs(errors)))
+    return rmse, mae
+
+
+def fit_als(R_train_coo, R_val_coo=None, k=10, lambda_reg=5.0, max_iter=20, tol=1e-4, random_state=42, verbose=True):
+    R_csr = R_train_coo.tocsr()
+    R_T_csr = R_train_coo.tocsc().T.tocsr()
+    n_users, n_movies = R_train_coo.shape
+
+    rng = np.random.default_rng(random_state)
+    global_mean = np.mean(R_train_coo.data)
+    init_mean = np.sqrt(global_mean / k)
+    U = init_mean + rng.normal(0.0, 0.1, size=(n_users, k))
+    V = init_mean + rng.normal(0.0, 0.1, size=(n_movies, k))
+
+    history = {"iter": [], "train_rmse": [], "val_rmse": [], "val_mae": []}
+
+    for it in range(1, max_iter + 1):
+        U = solve_als_subproblem(V, R_csr, lambda_reg)
+        V = solve_als_subproblem(U, R_T_csr, lambda_reg)
+
+        train_rmse, _ = evaluate_metrics_sparse(R_train_coo, U, V)
+        history["iter"].append(it)
+        history["train_rmse"].append(train_rmse)
+
+        if R_val_coo is not None:
+            val_rmse, val_mae = evaluate_metrics_sparse(R_val_coo, U, V)
+            history["val_rmse"].append(val_rmse)
+            history["val_mae"].append(val_mae)
+            if verbose:
+                print(f"Iteration {it:02d}/{max_iter:02d} | Train RMSE: {train_rmse:.4f} | Val RMSE: {val_rmse:.4f} | Val MAE: {val_mae:.4f}")
+        else:
+            if verbose:
+                print(f"Iteration {it:02d}/{max_iter:02d} | Train RMSE: {train_rmse:.4f}")
+
+        if it > 1:
+            rel_change = abs(history["train_rmse"][-2] - train_rmse) / history["train_rmse"][-2]
+            if rel_change < tol:
+                if verbose:
+                    print(f"Converged at iteration {it} (relative change {rel_change:.2e} < {tol}).")
+                break
+
+    return U, V, pd.DataFrame(history)
+
+
+# 3. Test Run
+print("\n--- Running Test ALS Model ---")
+U_test, V_test, history_df = fit_als(
+    R_train_coo, R_val_coo, k=10, lambda_reg=10.0, max_iter=15, verbose=True
+)
+
+
+# 4. Hyperparameter Tuning (Grid Search)
+print("\n--- Starting Hyperparameter Tuning ---")
+rank_candidates = [2, 5, 10, 20, 30, 50]
+lambda_candidates = [0.1, 1.0, 5.0, 10.0, 15.0, 25.0]
+
+tuning_records = []
+best_val_rmse = float("inf")
+best_config = None
+best_factors = None
+best_history = None
+
+start_time = time.time()
+
+for k in rank_candidates:
+    for lam in lambda_candidates:
+        U_curr, V_curr, hist_curr = fit_als(
+            R_train_coo, R_val_coo,
+            k=k, lambda_reg=lam,
+            max_iter=15, tol=1e-4,
+            random_state=42, verbose=False
+        )
+        final_train_rmse = hist_curr["train_rmse"].iloc[-1]
+        final_val_rmse = hist_curr["val_rmse"].iloc[-1]
+        final_val_mae = hist_curr["val_mae"].iloc[-1]
+
+        tuning_records.append({
+            "k": k,
+            "lambda": lam,
+            "Train_RMSE": final_train_rmse,
+            "Val_RMSE": final_val_rmse,
+            "Val_MAE": final_val_mae,
+            "Iterations": len(hist_curr)
+        })
+
+        if final_val_rmse < best_val_rmse:
+            best_val_rmse = final_val_rmse
+            best_config = {"k": k, "lambda": lam, "Val_RMSE": final_val_rmse, "Val_MAE": final_val_mae}
+            best_factors = (U_curr, V_curr)
+            best_history = hist_curr
+
+tuning_df = pd.DataFrame(tuning_records).sort_values(["Val_RMSE", "k"]).reset_index(drop=True)
+
+print(f"Grid search completed in {time.time() - start_time:.2f} seconds.")
+print(f"Best Hyperparameters -> Rank k: {best_config['k']}, Lambda: {best_config['lambda']}")
+print(f"Best Validation RMSE: {best_config['Val_RMSE']:.4f} | Validation MAE: {best_config['Val_MAE']:.4f}")
+
+
+# 5. Visualization
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+for lam in lambda_candidates:
+    subset = tuning_df[tuning_df["lambda"] == lam].sort_values("k")
+    axes[0].plot(subset["k"], subset["Val_RMSE"], marker="o", label=f"lambda = {lam}")
+
+axes[0].set_title("Validation RMSE vs. Target Rank k across lambda")
+axes[0].set_xlabel("Target Rank (k)")
+axes[0].set_ylabel("Validation RMSE")
+axes[0].grid(True, alpha=0.3)
+axes[0].legend()
+
+comparison_df = pd.DataFrame([
+    {"Model": "Naive SVD (k=10)", "RMSE": 2.6165, "MAE": 2.3469},
+    {"Model": "Global Mean", "RMSE": 1.1244, "MAE": 0.9433},
+    {"Model": "User Mean", "RMSE": 1.0358, "MAE": 0.8290},
+    {"Model": "Movie Mean", "RMSE": 1.0223, "MAE": 0.8144},
+    {"Model": f"Regularized ALS\n(k={best_config['k']}, lam={best_config['lambda']})", 
+     "RMSE": best_config["Val_RMSE"], "MAE": best_config["Val_MAE"]}
+])
+
+comparison_df.set_index("Model")[["RMSE", "MAE"]].plot(
+    kind="bar", ax=axes[1], rot=15, color=["slateblue", "skyblue"]
+)
+for container in axes[1].containers:
+    axes[1].bar_label(container, fmt="%.3f", padding=3)
+
+axes[1].set_title("Validation Error Comparison: Baselines vs. Regularized ALS")
+axes[1].set_ylabel("Error in Rating Points")
+axes[1].set_ylim(0, 3.1)
+axes[1].grid(axis="y", alpha=0.3)
+
+plt.tight_layout()
+plt.show()
+
+
+# 6. Saving Outputs for Member 3
+U_best, V_best = best_factors
+
+PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+np.save(PROCESSED_DIR / "U_best.npy", U_best)
+np.save(PROCESSED_DIR / "V_best.npy", V_best)
+best_history.to_csv(PROCESSED_DIR / "als_best_convergence_history.csv", index=False)
+tuning_df.to_csv(PROCESSED_DIR / "als_hyperparameter_tuning.csv", index=False)
+
+print("\nSaved U_best.npy, V_best.npy, convergence history, and tuning table to:", PROCESSED_DIR)
